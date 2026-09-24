@@ -1,75 +1,63 @@
-# React + TypeScript + Vite
+<div align="center">
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+# 🎞️ Figugiffy
 
-Currently, two official plugins are available:
+### Upload Once. Explore. Select. Create.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+A local-first web application for extracting multiple moments from long-form videos and turning them into individual GIFs.
 
-## React Compiler
+<br />
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+![Status](https://img.shields.io/badge/Status-In%20Development-orange?style=for-the-badge)
+![React](https://img.shields.io/badge/React-TypeScript-61DAFB?style=for-the-badge&logo=react&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-646CFF?style=for-the-badge&logo=vite&logoColor=white)
+![Git](https://img.shields.io/badge/Git-Version%20Control-F05032?style=for-the-badge&logo=git&logoColor=white)
 
-## Expanding the ESLint configuration
+<br />
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+**One video → Multiple moments → Multiple GIFs**
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
+</div>
 
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
+---
 
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+## Overview
 
-```
+Figugiffy is a browser-based video-to-GIF workspace designed around a simple problem:
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+> **What if I want to create several GIFs from different moments of the same long video?**
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+Instead of repeatedly uploading the same video to a converter, Figugiffy is designed around a **single-upload, multi-selection workflow**.
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+The user loads a video once, explores its timeline, identifies interesting moments, creates multiple selections, and eventually generates separate GIFs from those selections.
 
-```
+The project is being developed with a **local-first approach**, with the goal of keeping media processing as close to the user's device as practical.
+
+---
+
+## The Core Workflow
+
+```text
+┌──────────────────────┐
+│     Upload Video     │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│   Explore Timeline   │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│  Select Many Moments │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│    Generate GIFs     │
+└──────────┬───────────┘
+           │
+           ▼
+┌──────────────────────┐
+│   Export GIF Files   │
+└──────────────────────┘
