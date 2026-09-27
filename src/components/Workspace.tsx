@@ -2,17 +2,41 @@ import { useEffect, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import GIF from 'gif.js.optimized'
 import gifWorkerUrl from 'gif.js.optimized/dist/gif.worker.js?url'
+import { FFmpeg } from '@ffmpeg/ffmpeg'
+import {
+  getAdaptiveConcurrencyLimit,
+  getNextQueuedJob,
+  getRetryDecision,
+  shouldDegradeQueue,
+  type RuntimeHealthState,
+} from '../lib/scheduler'
 
 type ScreenKey = 'empty' | 'loaded' | 'selection' | 'batch' | 'processing' | 'results'
 
+const screens: { key: ScreenKey; label: string }[] = [
+  { key: 'empty', label: 'Upload' },
+  { key: 'loaded', label: 'Preview' },
+  { key: 'selection', label: 'Trim' },
+  { key: 'batch', label: 'Queue' },
+  { key: 'processing', label: 'Convert' },
+  { key: 'results', label: 'Results' },
+]
+
 type QueueItem = {
-  id: number
+  id: string
   label: string
   start: number
   end: number
   gifUrl?: string
   gifSizeBytes?: number
+  mp4Url?: string
+  mp4SizeBytes?: number
+  outputFormat?: ExportFormat
+  previewSrc?: string
+  status: 'waiting' | 'processing' | 'ready' | 'failed' | 'cancelled'
+  progress: number
   error?: string
+  attempts: number
 }
 
 type SpeedPreset = 0.5 | 1 | 1.5 | 2
@@ -20,10 +44,38 @@ type SpeedPreset = 0.5 | 1 | 1.5 | 2
 type QualityPreset = 'Low' | 'Medium' | 'High'
 type ResolutionPreset = '480p' | '720p' | 'Original'
 type PlaybackMode = 'full' | 'selection'
+type ExportFormat = 'gif' | 'mp4'
+
+type ExportPolicy = {
+  workers: number
+  fps: number
+  quality: QualityPreset
+  resolution: ResolutionPreset
+  sampleScale: number
+  retries: number
+}
 
 type TimelineThumbnail = {
   time: number
   src: string
+}
+
+type ReadyExport = {
+  format: ExportFormat
+  url: string
+  sizeBytes?: number
+}
+
+const getReadyExport = (item: QueueItem): ReadyExport | undefined => {
+  if (item.outputFormat === 'mp4' && item.mp4Url) {
+    return { format: 'mp4', url: item.mp4Url, sizeBytes: item.mp4SizeBytes }
+  }
+  if (item.outputFormat !== 'mp4' && item.gifUrl) {
+    return { format: 'gif', url: item.gifUrl, sizeBytes: item.gifSizeBytes }
+  }
+  if (item.mp4Url) return { format: 'mp4', url: item.mp4Url, sizeBytes: item.mp4SizeBytes }
+  if (item.gifUrl) return { format: 'gif', url: item.gifUrl, sizeBytes: item.gifSizeBytes }
+  return undefined
 }
 
 const formatTime = (value: number) => {
@@ -55,7 +107,99 @@ const formatFileSize = (bytes: number) => {
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
 }
 
-const loadExportVideo = (src: string) => new Promise<HTMLVideoElement>((resolve, reject) => {
+const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max)
+
+const getErrorMessage = (error: unknown, fallback: string) => {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string' && error.trim()) return error
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message
+  return fallback
+}
+
+const getAdaptiveExportPolicy = (
+  item: QueueItem,
+  video: HTMLVideoElement,
+  activeJobs: number,
+  queueLength: number,
+  preferredQuality: QualityPreset,
+  preferredFps: number,
+  preferredResolution: ResolutionPreset,
+  runtimeHealth: RuntimeHealthState = { totalFailures: 0, totalRecoveries: 0, degradedMode: false },
+): ExportPolicy => {
+  const duration = Math.max(0.1, Math.abs(item.end - item.start))
+  const width = video.videoWidth || 1280
+  const height = video.videoHeight || 720
+  const pixelVolume = width * height
+  const queuePressure = clamp(queueLength / 8, 0, 1)
+  const jobPressure = clamp(activeJobs / 4, 0, 1)
+  const resolutionPressure = clamp(pixelVolume / 1_500_000, 0, 1)
+  const durationPressure = clamp(duration / 20, 0, 1)
+  const hardwareCpu = typeof navigator !== 'undefined' && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4
+  const perClipWorkerBudget = clamp(Math.floor(hardwareCpu / Math.max(1, activeJobs)), 1, 2)
+  const devicePressure = hardwareCpu <= 4 ? 0.12 : 0
+  const failurePressure = clamp(runtimeHealth.totalFailures * 0.18, 0, 0.45)
+  const degradedBias = runtimeHealth.degradedMode ? 0.2 : 0
+
+  const risk = clamp(
+    durationPressure * 0.35
+      + resolutionPressure * 0.35
+      + queuePressure * 0.15
+      + jobPressure * 0.15
+      + devicePressure
+      + failurePressure
+      + degradedBias,
+    0,
+    1,
+  )
+
+  const resolutionRank: Record<ResolutionPreset, number> = { '480p': 0, '720p': 1, Original: 2 }
+  const lowerResolution = (resolution: ResolutionPreset): ResolutionPreset => (
+    resolutionRank[resolution] >= 2 ? '720p' : '480p'
+  )
+
+  if (risk < 0.35) {
+    return {
+      workers: perClipWorkerBudget,
+      fps: preferredFps,
+      quality: preferredQuality,
+      resolution: preferredResolution,
+      sampleScale: 1,
+      retries: 1,
+    }
+  }
+
+  if (risk < 0.7) {
+    return {
+      workers: Math.min(perClipWorkerBudget, clamp(Math.floor(hardwareCpu / 2), 1, 2)),
+      fps: preferredFps,
+      quality: preferredQuality,
+      resolution: lowerResolution(preferredResolution),
+      sampleScale: 1,
+      retries: 2,
+    }
+  }
+
+  return {
+    workers: 1,
+    fps: preferredFps,
+    quality: preferredQuality === 'Low' ? 'Low' : 'Medium',
+    resolution: '480p',
+    sampleScale: 1,
+    retries: 2,
+  }
+}
+
+const getFallbackPolicy = (policy: ExportPolicy): ExportPolicy => ({
+  ...policy,
+  workers: 1,
+  fps: policy.fps,
+  quality: policy.quality === 'Low' ? 'Low' : 'Medium',
+  resolution: policy.resolution === 'Original' ? '720p' : '480p',
+  sampleScale: 1,
+  retries: 0,
+})
+
+const loadExportVideo = (src: string, signal?: AbortSignal) => new Promise<HTMLVideoElement>((resolve, reject) => {
   const video = document.createElement('video')
   video.preload = 'auto'
   video.muted = true
@@ -69,6 +213,7 @@ const loadExportVideo = (src: string) => new Promise<HTMLVideoElement>((resolve,
     window.clearTimeout(timeout)
     video.removeEventListener('loadedmetadata', onLoaded)
     video.removeEventListener('error', onError)
+    signal?.removeEventListener('abort', onAbort)
   }
   const onLoaded = () => {
     cleanup()
@@ -78,12 +223,98 @@ const loadExportVideo = (src: string) => new Promise<HTMLVideoElement>((resolve,
     cleanup()
     reject(new Error('The source video could not be decoded for GIF conversion.'))
   }
+  const onAbort = () => {
+    cleanup()
+    video.removeAttribute('src')
+    video.load()
+    reject(new Error('Cancelled by user.'))
+  }
+
+  if (signal?.aborted) {
+    onAbort()
+    return
+  }
 
   video.addEventListener('loadedmetadata', onLoaded, { once: true })
   video.addEventListener('error', onError, { once: true })
+  signal?.addEventListener('abort', onAbort, { once: true })
   video.src = src
   video.load()
 })
+
+const mp4Encoder = new FFmpeg()
+let mp4EncoderLoad: Promise<void> | null = null
+let mp4EncoderQueue: Promise<void> = Promise.resolve()
+
+const createMp4FromRange = (sourceUrl: string, sourceName: string, start: number, end: number, reportProgress: (progress: number) => void) => {
+  const encode = async () => {
+    if (!mp4EncoderLoad) {
+      const baseUrl = import.meta.env.BASE_URL
+      mp4EncoderLoad = (async () => {
+        const coreResponse = await fetch(`${baseUrl}ffmpeg/ffmpeg-core.js`)
+        if (!coreResponse.ok) throw new Error('Could not load the MP4 encoder script.')
+        const coreBlobUrl = URL.createObjectURL(await coreResponse.blob())
+        try {
+          await mp4Encoder.load({
+            coreURL: coreBlobUrl,
+            wasmURL: `${baseUrl}ffmpeg/ffmpeg-core.wasm`,
+          })
+        } finally {
+          URL.revokeObjectURL(coreBlobUrl)
+        }
+      })().catch((error: unknown) => {
+        mp4EncoderLoad = null
+        throw error
+      })
+    }
+    await mp4EncoderLoad
+    reportProgress(0.05)
+
+    const response = await fetch(sourceUrl)
+    if (!response.ok) throw new Error('Could not read the source video for MP4 export.')
+    const input = new Uint8Array(await response.arrayBuffer())
+    const sourceExtension = sourceName.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase()
+    const supportedExtensions = new Set(['mp4', 'mov', 'm4v', 'webm', 'ogv', 'mkv', 'avi'])
+    const inputName = `source.${sourceExtension && supportedExtensions.has(sourceExtension) ? sourceExtension : 'mp4'}`
+    const outputName = `clip-${Date.now()}.mp4`
+    const onProgress = ({ progress }: { progress: number }) => reportProgress(0.1 + Math.max(0, Math.min(1, progress)) * 0.85)
+    let lastEncoderError = ''
+    const onLog = ({ message }: { message: string }) => {
+      if (/error|failed|unknown|invalid|not found/i.test(message)) lastEncoderError = message.trim()
+    }
+
+    mp4Encoder.on('progress', onProgress)
+    mp4Encoder.on('log', onLog)
+    try {
+      await mp4Encoder.writeFile(inputName, input)
+      const exitCode = await mp4Encoder.exec([
+        '-ss', Math.max(0, start).toFixed(3),
+        '-i', inputName,
+        '-t', Math.max(0.05, end - start).toFixed(3),
+        '-an',
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '23',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', '+faststart',
+        outputName,
+      ])
+      if (exitCode !== 0) throw new Error(`MP4 encoding failed${lastEncoderError ? `: ${lastEncoderError}` : '. Try a shorter clip or another source video.'}`)
+      const output = await mp4Encoder.readFile(outputName)
+      if (typeof output === 'string' || !output.byteLength) throw new Error('The MP4 encoder produced an empty file.')
+      reportProgress(1)
+      return new Blob([new Uint8Array(output)], { type: 'video/mp4' })
+    } finally {
+      mp4Encoder.off('progress', onProgress)
+      mp4Encoder.off('log', onLog)
+      await Promise.allSettled([mp4Encoder.deleteFile(inputName), mp4Encoder.deleteFile(outputName)])
+    }
+  }
+
+  const queuedEncode = mp4EncoderQueue.then(encode)
+  mp4EncoderQueue = queuedEncode.then(() => undefined, () => undefined)
+  return queuedEncode
+}
 
 const getDefaultSelectionRange = (videoDuration: number) => {
   const safeDuration = Number.isFinite(videoDuration) ? Math.max(0, videoDuration) : 0
@@ -96,15 +327,6 @@ const getDefaultSelectionRange = (videoDuration: number) => {
   }
 }
 
-const screens: { key: ScreenKey; label: string }[] = [
-  { key: 'empty', label: '01 Empty state' },
-  { key: 'loaded', label: '02 Video loaded' },
-  { key: 'selection', label: '05 Fine selection' },
-  { key: 'batch', label: '07 Batch extraction' },
-  { key: 'processing', label: '09 Processing' },
-  { key: 'results', label: '10 GIF result' },
-]
-
 function Workspace() {
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const videoRef = useRef<HTMLVideoElement | null>(null)
@@ -115,6 +337,7 @@ function Workspace() {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
+  const [sourceDimensions, setSourceDimensions] = useState({ width: 1280, height: 720 })
   const [isPlaying, setIsPlaying] = useState(false)
   const [selectionStart, setSelectionStart] = useState(0)
   const [selectionEnd, setSelectionEnd] = useState(0)
@@ -126,21 +349,40 @@ function Workspace() {
   const [qualityPreset, setQualityPreset] = useState<QualityPreset>('High')
   const [renderFps, setRenderFps] = useState(15)
   const [renderResolution, setRenderResolution] = useState<ResolutionPreset>('720p')
+  const [exportFormat, setExportFormat] = useState<ExportFormat>('gif')
   const [timelineThumbnails, setTimelineThumbnails] = useState<TimelineThumbnail[]>([])
   const [selectionFrame, setSelectionFrame] = useState<string | null>(null)
   const [clipLengthSeconds, setClipLengthSeconds] = useState(10)
   const [zoomLevel, setZoomLevel] = useState(1)
-  const [processingProgress, setProcessingProgress] = useState(0)
   const [processingLabel, setProcessingLabel] = useState('')
   const [processingCount, setProcessingCount] = useState({ current: 0, total: 0 })
   const cancelProcessingRef = useRef(false)
+  const processingActiveRef = useRef(false)
+  const activeGifRefsRef = useRef<Map<string, { abort: () => void }>>(new Map())
+  const activePreparationRefsRef = useRef<Map<string, AbortController>>(new Map())
   const activeGifRef = useRef<{ abort: () => void } | null>(null)
+  const runtimeHealthRef = useRef<RuntimeHealthState>({ totalFailures: 0, totalRecoveries: 0, degradedMode: false })
   const [timelineWindowStart, setTimelineWindowStart] = useState(0)
   const [timelineWindowEnd, setTimelineWindowEnd] = useState(0)
   const [queue, setQueue] = useState<QueueItem[]>([])
   const [queueScrollTop, setQueueScrollTop] = useState(0)
 
   const selectionDuration = Math.max(0, selectionEnd - selectionStart)
+
+  const getQueueStatusCounts = () => {
+    const counts = { waiting: 0, processing: 0, ready: 0, failed: 0, cancelled: 0 }
+    queue.forEach((item) => {
+      counts[item.status] += 1
+    })
+    return counts
+  }
+
+  const getTimelinePreview = (time: number) => {
+    const closest = timelineThumbnails.reduce<TimelineThumbnail | null>((best, thumbnail) => (
+      !best || Math.abs(thumbnail.time - time) < Math.abs(best.time - time) ? thumbnail : best
+    ), null)
+    return closest?.src || selectionFrame || undefined
+  }
 
   useEffect(() => {
     const video = videoRef.current
@@ -239,7 +481,7 @@ function Workspace() {
   }, [videoUrl, duration, timelineWindowStart, timelineWindowEnd])
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
-    if (screen === 'processing') {
+    if (processingActiveRef.current) {
       event.target.value = ''
       return
     }
@@ -264,6 +506,7 @@ function Workspace() {
     }
     queue.forEach((item) => {
       if (item.gifUrl) URL.revokeObjectURL(item.gifUrl)
+      if (item.mp4Url) URL.revokeObjectURL(item.mp4Url)
     })
     setUploadError(null)
 
@@ -290,6 +533,7 @@ function Workspace() {
 
     queue.forEach((item) => {
       if (item.gifUrl) URL.revokeObjectURL(item.gifUrl)
+      if (item.mp4Url) URL.revokeObjectURL(item.mp4Url)
     })
     setUploadError(`This video cannot be previewed in the browser: ${browserMessage}. Please convert it to MP4 or WebM and upload again.`)
     setScreen('empty')
@@ -319,6 +563,7 @@ function Workspace() {
     const defaultSelection = getDefaultSelectionRange(safeDuration)
 
     setDuration(safeDuration)
+    setSourceDimensions({ width: video.videoWidth || 1280, height: video.videoHeight || 720 })
     setSelectionStart(defaultSelection.start)
     setSelectionEnd(defaultSelection.end)
     setTimelineWindowStart(0)
@@ -437,10 +682,14 @@ function Workspace() {
       const itemEnd = Math.min(itemStart + segmentLength, end)
 
       generated.push({
-        id: Date.now() + index,
+        id: crypto.randomUUID(),
         label: `GIF ${String(queue.length + index + 1).padStart(2, '0')}`,
         start: itemStart,
         end: itemEnd,
+        previewSrc: getTimelinePreview(itemStart),
+        status: 'waiting',
+        progress: 0,
+        attempts: 0,
       })
     }
 
@@ -465,58 +714,99 @@ function Workspace() {
 
   const seekVideoToTime = (video: HTMLVideoElement, value: number) =>
     new Promise<void>((resolve, reject) => {
-      if (Math.abs(video.currentTime - value) < 0.001) {
-        resolve()
+      if (!video || !Number.isFinite(value)) {
+        reject(new Error('The requested media time is invalid.'))
         return
       }
 
-      const timeout = window.setTimeout(() => {
+      const maxTime = Number.isFinite(video.duration) ? Math.max(0, video.duration - 0.05) : 0
+      const safeValue = Math.min(Math.max(value, 0), maxTime)
+
+      const finish = (callback: () => void) => {
         cleanup()
-        reject(new Error(`Timed out seeking to ${formatPreciseTime(value)}.`))
-      }, 15000)
-      const cleanup = () => {
-        window.clearTimeout(timeout)
-        video.removeEventListener('seeked', handleSeeked)
-        video.removeEventListener('error', handleError)
-      }
-      const handleSeeked = () => {
-        cleanup()
-        resolve()
-      }
-      const handleError = () => {
-        cleanup()
-        reject(new Error('The video could not seek to a frame for GIF conversion.'))
+        callback()
       }
 
+      const cleanup = () => {
+        window.clearTimeout(timeoutId)
+        video.removeEventListener('seeked', handleSeeked)
+        video.removeEventListener('error', handleError)
+        video.removeEventListener('loadeddata', handleLoadedData)
+      }
+
+      const handleLoadedData = () => {
+        if (video.readyState >= 1 && Number.isFinite(video.duration)) {
+          finish(() => resolve())
+        }
+      }
+
+      const handleSeeked = () => {
+        if (Math.abs(video.currentTime - safeValue) < 0.05) {
+          finish(() => resolve())
+        }
+      }
+
+      const handleError = () => {
+        finish(() => reject(new Error('The video could not seek to a frame for GIF conversion.')))
+      }
+
+      const timeoutId = window.setTimeout(() => {
+        if (Number.isFinite(video.duration) && Math.abs(video.currentTime - safeValue) < 0.05) {
+          finish(() => resolve())
+          return
+        }
+        finish(() => reject(new Error(`Timed out seeking to ${formatPreciseTime(safeValue)}.`)))
+      }, 20000)
+
+      if (video.readyState < 1 || !Number.isFinite(video.duration)) {
+        video.addEventListener('loadeddata', handleLoadedData, { once: true })
+        video.addEventListener('error', handleError, { once: true })
+        return
+      }
+
+      video.pause()
       video.addEventListener('seeked', handleSeeked, { once: true })
       video.addEventListener('error', handleError, { once: true })
+
       try {
-        video.currentTime = value
+        video.currentTime = safeValue
       } catch (error) {
-        cleanup()
-        reject(error)
+        finish(() => reject(error))
       }
     })
 
-  const createGifFromRange = async (item: QueueItem, video: HTMLVideoElement, reportProgress: (value: number) => void): Promise<QueueItem> => {
+  const createGifFromRange = async (
+    item: QueueItem,
+    video: HTMLVideoElement,
+    reportProgress: (value: number, previewSrc?: string) => void,
+    policy: ExportPolicy = {
+      workers: 2,
+      fps: renderFps,
+      quality: qualityPreset,
+      resolution: renderResolution,
+      sampleScale: 1,
+      retries: 1,
+    },
+    retryLevel = 0,
+  ): Promise<QueueItem> => {
     const start = Math.min(item.start, item.end)
     const end = Math.max(item.start, item.end)
     const clipDuration = Math.max(0.05, end - start)
     const qualityMap: Record<QualityPreset, number> = {
       Low: 20,
       Medium: 12,
-      High: 10,
+      High: 5,
     }
     const widthLimit: Record<ResolutionPreset, number> = {
       '480p': 854,
       '720p': 1280,
       Original: video.videoWidth || 1280,
     }
-    const baseWidth = Math.max(320, Math.min(video.videoWidth || 1280, widthLimit[renderResolution]))
+    const baseWidth = Math.max(320, Math.min(video.videoWidth || 1280, widthLimit[policy.resolution]))
     const width = Math.max(320, Math.round(baseWidth))
     const height = Math.max(180, Math.round((video.videoHeight / Math.max(video.videoWidth, 1)) * width))
-    const frameRate = renderFps
-    const sampleFrames = Math.max(1, Math.min(300, Math.ceil(clipDuration * frameRate)))
+    const frameRate = policy.fps
+    const sampleFrames = Math.max(1, Math.min(300, Math.ceil(clipDuration * frameRate * policy.sampleScale)))
     const frameDelay = (clipDuration * 1000) / sampleFrames
     const canvas = document.createElement('canvas')
     const context = canvas.getContext('2d')
@@ -529,39 +819,82 @@ function Workspace() {
     canvas.height = height
 
     const gif = new GIF({
-      workers: 2,
-      quality: qualityMap[qualityPreset],
+      workers: policy.workers,
+      quality: qualityMap[policy.quality],
       workerScript: gifWorkerUrl,
       width,
       height,
       repeat: 0,
     })
+    activeGifRefsRef.current.set(item.id, gif)
     activeGifRef.current = gif
 
-    for (let index = 0; index < sampleFrames; index += 1) {
-      if (cancelProcessingRef.current) throw new Error('Cancelled by user.')
-      const time = Math.min(start + ((index / sampleFrames) * clipDuration), Math.max(0, video.duration - 0.01))
-      await seekVideoToTime(video, time)
-      context.drawImage(video, 0, 0, width, height)
-      gif.addFrame(canvas, { copy: true, delay: frameDelay })
-      reportProgress(((index + 1) / sampleFrames) * 0.5)
-    }
+    try {
+      for (let index = 0; index < sampleFrames; index += 1) {
+        if (cancelProcessingRef.current) throw new Error('Cancelled by user.')
+        const rawTime = start + ((index / sampleFrames) * clipDuration)
+        const safeClipTime = Number.isFinite(video.duration)
+          ? Math.min(Math.max(rawTime, 0), Math.max(0, video.duration - 0.05))
+          : Math.max(0, rawTime)
+        await seekVideoToTime(video, safeClipTime)
+        if (cancelProcessingRef.current) throw new Error('Cancelled by user.')
+        context.drawImage(video, 0, 0, width, height)
+        gif.addFrame(canvas, { copy: true, delay: frameDelay })
+        let previewSrc: string | undefined
+        if (index === 0) {
+          const previewCanvas = document.createElement('canvas')
+          const previewWidth = Math.min(360, width)
+          const previewHeight = Math.max(1, Math.round((height / width) * previewWidth))
+          previewCanvas.width = previewWidth
+          previewCanvas.height = previewHeight
+          previewCanvas.getContext('2d')?.drawImage(video, 0, 0, previewWidth, previewHeight)
+          previewSrc = previewCanvas.toDataURL('image/jpeg', 0.78)
+        }
+        reportProgress(((index + 1) / sampleFrames) * 0.4, previewSrc)
+      }
 
-    const blob = await new Promise<Blob>((resolve, reject) => {
-      gif.on('finished', (result: Blob) => resolve(result))
-      gif.on('abort', () => reject(new Error('GIF export aborted')))
-      gif.on('error', (error: Error) => reject(error))
-      gif.on('progress', (progress: number) => {
-        reportProgress(0.5 + progress * 0.5)
+      const blob = await new Promise<Blob>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          reject(new Error('GIF encoding took too long. Try a lower resolution or FPS and retry.'))
+          gif.abort()
+        }, Math.max(60000, sampleFrames * 3000))
+        const finish = (callback: () => void) => {
+          window.clearTimeout(timeout)
+          callback()
+        }
+        gif.on('finished', (result: Blob) => finish(() => resolve(result)))
+        gif.on('abort', () => finish(() => reject(new Error('GIF export aborted'))))
+        gif.on('error', (error: Error) => finish(() => reject(error)))
+        gif.on('progress', (progress: number) => {
+          reportProgress(0.4 + progress * 0.6)
+        })
+        gif.render()
       })
-      gif.render()
-    })
 
-    return {
-      ...item,
-      gifUrl: URL.createObjectURL(blob),
-      gifSizeBytes: blob.size,
-      error: undefined,
+      return {
+        ...item,
+        gifUrl: URL.createObjectURL(blob),
+        gifSizeBytes: blob.size,
+        status: 'ready',
+        progress: 100,
+        error: undefined,
+      }
+    } catch (error) {
+      runtimeHealthRef.current.totalFailures += 1
+      runtimeHealthRef.current.degradedMode = true
+      setProcessingLabel('Adaptive safety mode…')
+
+      if (!cancelProcessingRef.current && retryLevel < policy.retries) {
+        runtimeHealthRef.current.totalRecoveries += 1
+        const nextPolicy = getFallbackPolicy(policy)
+        return createGifFromRange(item, video, reportProgress, nextPolicy, retryLevel + 1)
+      }
+      throw error
+    } finally {
+      activeGifRefsRef.current.delete(item.id)
+      if (activeGifRef.current === gif) {
+        activeGifRef.current = null
+      }
     }
   }
 
@@ -654,10 +987,15 @@ function Workspace() {
     setQueue((currentQueue) => [
       ...currentQueue,
       {
-        id: Date.now(),
-        label: `GIF ${String(currentQueue.length + 1).padStart(2, '0')}`,
+        id: crypto.randomUUID(),
+        label: `Clip ${String(currentQueue.length + 1).padStart(2, '0')}`,
         start: safeStart,
         end: safeEnd,
+        outputFormat: exportFormat,
+        previewSrc: getTimelinePreview(safeStart),
+        status: 'waiting',
+        progress: 0,
+        attempts: 0,
       },
     ])
     setQueueScrollTop(0)
@@ -665,83 +1003,235 @@ function Workspace() {
     setScreen('batch')
   }
 
-  const startProcessingQueue = async (retryFailed = false, onlyItemId?: number) => {
+  const chooseExportFormat = (format: ExportFormat) => {
+    setExportFormat(format)
+    setQueue((currentQueue) => currentQueue.map((item) => (
+      item.status === 'waiting' || item.status === 'failed' || item.status === 'cancelled'
+        ? { ...item, outputFormat: format, error: undefined, attempts: 0 }
+        : item
+    )))
+  }
+
+  const startProcessingQueue = async (retryFailed = false, onlyItemId?: string) => {
     const itemsToProcess = retryFailed
       ? queue.filter((item) => item.error && (onlyItemId === undefined || item.id === onlyItemId))
       : queue
-    if (!itemsToProcess.length || !videoUrl || screen === 'processing') {
+    if (!itemsToProcess.length || !videoUrl || processingActiveRef.current) {
       return
     }
 
+    const activeBatchLimit = 4
+    const getCurrentMaxWorkers = () => {
+      const hardwareCpu = typeof navigator !== 'undefined' && navigator.hardwareConcurrency ? navigator.hardwareConcurrency : 4
+      const adaptiveLimit = getAdaptiveConcurrencyLimit(Math.min(itemsToProcess.length, activeBatchLimit), runtimeHealthRef.current, hardwareCpu)
+      return Math.min(adaptiveLimit, Math.max(1, Math.min(activeBatchLimit, itemsToProcess.length)))
+    }
+
+    let maxConcurrentWorkers = getCurrentMaxWorkers()
+
     cancelProcessingRef.current = false
+    processingActiveRef.current = true
+    runtimeHealthRef.current = { totalFailures: 0, totalRecoveries: 0, degradedMode: false }
     setProcessingCount({ current: 0, total: itemsToProcess.length })
     setProcessingLabel('Preparing video…')
-    setProcessingProgress(0)
     setScreen('processing')
-    let exportVideo: HTMLVideoElement | null = null
+    setQueue((currentQueue) => currentQueue.map((item) => (
+      itemsToProcess.some((target) => target.id === item.id)
+        ? { ...item, status: 'waiting', progress: 0, error: undefined }
+        : item
+    )))
 
-    try {
-      exportVideo = await loadExportVideo(videoUrl)
-      const processedQueue: QueueItem[] = []
+    const finishedIds = new Set<string>()
+    const stagedItems = [...itemsToProcess]
+    const runningItems = new Set<string>()
 
-      for (let index = 0; index < itemsToProcess.length; index += 1) {
-        if (cancelProcessingRef.current) break
-        const item = itemsToProcess[index]
-        setProcessingCount({ current: index + 1, total: itemsToProcess.length })
-        setProcessingLabel(item.label)
+    const updateProcessingMetrics = () => {
+      const completedCount = itemsToProcess.filter((item) => finishedIds.has(item.id)).length
+      const activeCount = runningItems.size
+      const progressValue = Math.min(itemsToProcess.length, completedCount + activeCount)
+      setProcessingCount({ current: progressValue, total: itemsToProcess.length })
+
+      const activeLabel = itemsToProcess.find((item) => runningItems.has(item.id))?.label
+      if (activeLabel) {
+        setProcessingLabel(activeLabel)
+      }
+    }
+
+    const runNext = () => {
+      maxConcurrentWorkers = getCurrentMaxWorkers()
+
+      if (cancelProcessingRef.current) {
+        if (runningItems.size === 0) {
+          processingActiveRef.current = false
+          setQueue((currentQueue) => currentQueue.map((item) => (
+            stagedItems.some((staged) => staged.id === item.id) && item.status === 'waiting'
+              ? { ...item, status: 'cancelled', error: 'Cancelled by user.' }
+              : item
+          )))
+          setScreen('results')
+        }
+        return
+      }
+
+      if (runningItems.size >= maxConcurrentWorkers) {
+        return
+      }
+
+      const item = getNextQueuedJob(stagedItems, runningItems, finishedIds)
+      if (!item) {
+        if (runningItems.size === 0) {
+          processingActiveRef.current = false
+          setScreen('results')
+        }
+        return
+      }
+
+      const stagedIndex = stagedItems.findIndex((queuedItem) => queuedItem.id === item.id)
+      if (stagedIndex >= 0) {
+        stagedItems.splice(stagedIndex, 1)
+      }
+
+      runningItems.add(item.id)
+      updateProcessingMetrics()
+      setQueue((currentQueue) => currentQueue.map((queuedItem) => (
+        queuedItem.id === item.id ? { ...queuedItem, status: 'processing', progress: 0, error: undefined } : queuedItem
+      )))
+
+      void (async () => {
         let processedItem: QueueItem
+        let lastProgressUpdate = 0
+        let workerVideo: HTMLVideoElement | null = null
+        const preparationController = new AbortController()
+        activePreparationRefsRef.current.set(item.id, preparationController)
+
         try {
-          processedItem = await createGifFromRange(item, exportVideo, (itemProgress) => {
-            setProcessingProgress(((index + itemProgress) / itemsToProcess.length) * 100)
-          })
+          workerVideo = await loadExportVideo(videoUrl, preparationController.signal)
+          const adaptivePolicy = getAdaptiveExportPolicy(
+            item,
+            workerVideo,
+            runningItems.size,
+            queue.length,
+            qualityPreset,
+            renderFps,
+            renderResolution,
+            runtimeHealthRef.current,
+          )
+
+          const onProgress = (itemProgress: number, previewSrc?: string) => {
+            const now = performance.now()
+            if (itemProgress < 1 && now - lastProgressUpdate < 80 && !previewSrc) return
+            lastProgressUpdate = now
+            setQueue((currentQueue) => currentQueue.map((queuedItem) => (
+              queuedItem.id === item.id
+                ? { ...queuedItem, progress: Math.round(itemProgress * 100), previewSrc: previewSrc || queuedItem.previewSrc }
+                : queuedItem
+            )))
+          }
+          if ((item.outputFormat || exportFormat) === 'mp4') {
+            const blob = await createMp4FromRange(videoUrl, videoName, item.start, item.end, (progress) => onProgress(progress))
+            processedItem = { ...item, mp4Url: URL.createObjectURL(blob), mp4SizeBytes: blob.size, status: 'ready', progress: 100, error: undefined }
+          } else {
+            processedItem = await createGifFromRange(item, workerVideo, onProgress, adaptivePolicy)
+          }
         } catch (error) {
+          runtimeHealthRef.current.totalFailures += 1
+          if (shouldDegradeQueue(runtimeHealthRef.current, itemsToProcess.length)) {
+            runtimeHealthRef.current.degradedMode = true
+            setProcessingLabel('Adaptive safety mode…')
+          }
+
+          const nextAttempts = (item.attempts ?? 0) + 1
+          const retryDecision = getRetryDecision(item.attempts ?? 0)
+          const retryAllowed = !cancelProcessingRef.current && retryDecision.retryAllowed
+
+          if (retryAllowed) {
+            runtimeHealthRef.current.totalRecoveries += 1
+            const retriedItem: QueueItem = {
+              ...item,
+              attempts: nextAttempts,
+              status: 'waiting',
+              progress: 0,
+              error: undefined,
+            }
+
+            stagedItems.push(retriedItem)
+            setQueue((currentQueue) => currentQueue.map((queuedItem) => (
+              queuedItem.id === item.id ? retriedItem : queuedItem
+            )))
+            runningItems.delete(item.id)
+            updateProcessingMetrics()
+            if (!cancelProcessingRef.current) {
+              runNext()
+            }
+            return
+          }
+
           processedItem = {
             ...item,
-            error: cancelProcessingRef.current ? 'Cancelled by user.' : error instanceof Error ? error.message : 'This clip could not be converted.',
+            attempts: item.attempts ?? 0,
+            status: cancelProcessingRef.current ? 'cancelled' : 'failed',
+            progress: cancelProcessingRef.current ? item.progress : 0,
+            error: cancelProcessingRef.current ? 'Cancelled by user.' : getErrorMessage(error, 'This clip could not be converted.'),
+          }
+        } finally {
+          activePreparationRefsRef.current.delete(item.id)
+          if (workerVideo) {
+            workerVideo.pause()
+            workerVideo.removeAttribute('src')
+            workerVideo.load()
           }
         }
-        processedQueue.push(processedItem)
-        setProcessingProgress(((index + 1) / itemsToProcess.length) * 100)
-        if (cancelProcessingRef.current) break
+
+        if (item.gifUrl && processedItem.gifUrl && item.gifUrl !== processedItem.gifUrl) URL.revokeObjectURL(item.gifUrl)
+        if (item.mp4Url && processedItem.mp4Url && item.mp4Url !== processedItem.mp4Url) URL.revokeObjectURL(item.mp4Url)
+        setQueue((currentQueue) => currentQueue.map((queuedItem) => (
+          queuedItem.id === item.id
+            ? { ...processedItem, previewSrc: queuedItem.previewSrc || processedItem.previewSrc, progress: processedItem.status === 'ready' ? 100 : queuedItem.progress }
+            : queuedItem
+        )))
+
+        finishedIds.add(item.id)
+        runningItems.delete(item.id)
+        updateProcessingMetrics()
+
+        runNext()
+      })()
+    }
+
+    try {
+      for (let workerIndex = 0; workerIndex < Math.min(maxConcurrentWorkers, itemsToProcess.length); workerIndex += 1) {
+        runNext()
       }
 
-      const processedById = new Map(processedQueue.map((item) => [item.id, item]))
-      setQueue((currentQueue) => currentQueue.map((item) => {
-        const processedItem = processedById.get(item.id)
-        if (!processedItem) {
-          if (cancelProcessingRef.current && itemsToProcess.some((pendingItem) => pendingItem.id === item.id)) {
-            return { ...item, error: item.error || 'Cancelled by user.' }
-          }
-          return item
-        }
-        if (item.gifUrl && processedItem.gifUrl && item.gifUrl !== processedItem.gifUrl) URL.revokeObjectURL(item.gifUrl)
-        return processedItem
-      }))
-      setScreen('results')
-    } catch (error) {
-      setUploadError(error instanceof Error ? error.message : 'The source video could not be prepared for conversion.')
-      setScreen('loaded')
-    } finally {
-      activeGifRef.current = null
-      if (exportVideo) {
-        exportVideo.pause()
-        exportVideo.removeAttribute('src')
-        exportVideo.load()
+      if (itemsToProcess.length === 0) {
+        setScreen('results')
       }
+    } catch (error) {
+      processingActiveRef.current = false
+      setUploadError(error instanceof Error ? error.message : 'The source video could not be prepared for conversion.')
+      setQueue((currentQueue) => currentQueue.map((item) => (
+        itemsToProcess.some((target) => target.id === item.id)
+          ? { ...item, status: 'failed', error: error instanceof Error ? error.message : 'The source video could not be prepared for conversion.' }
+          : item
+      )))
+      setScreen('results')
     }
   }
 
   const cancelProcessing = () => {
     cancelProcessingRef.current = true
+    activePreparationRefsRef.current.forEach((controller) => controller.abort())
+    activeGifRefsRef.current.forEach((gif) => gif.abort())
     activeGifRef.current?.abort()
   }
 
   const downloadAllGifs = () => {
-    const completed = queue.filter((item) => item.gifUrl)
-    completed.forEach((item) => {
+    queue.forEach((item) => {
+      const output = getReadyExport(item)
+      if (!output) return
       const link = document.createElement('a')
-      link.href = item.gifUrl as string
-      link.download = `${item.label}.gif`
+      link.href = output.url
+      link.download = `${item.label}.${output.format}`
       document.body.appendChild(link)
       link.click()
       link.remove()
@@ -749,9 +1239,14 @@ function Workspace() {
   }
 
   const startNewProject = () => {
+    if (processingActiveRef.current) {
+      return
+    }
+
     videoRef.current?.pause()
     queue.forEach((item) => {
       if (item.gifUrl) URL.revokeObjectURL(item.gifUrl)
+      if (item.mp4Url) URL.revokeObjectURL(item.mp4Url)
     })
     setVideoUrl(null)
     setVideoName('')
@@ -784,6 +1279,36 @@ function Workspace() {
   const queueVirtualEnd = queue.length > 100
     ? Math.min(queue.length, Math.ceil((queueScrollTop + 260) / queueRowStride) + 3)
     : queue.length
+  const sourceWidth = sourceDimensions.width
+  const sourceHeight = sourceDimensions.height
+  const requestedFrameCappedCount = queue.filter((item) => Math.ceil(Math.max(0.05, item.end - item.start) * renderFps) > 300).length
+  const largestRawFrameMemory = queue.reduce((largest, item) => {
+    const maxWidth = renderResolution === 'Original' ? sourceWidth : renderResolution === '720p' ? 1280 : 854
+    const width = Math.max(320, Math.min(sourceWidth, maxWidth))
+    const height = Math.max(180, Math.round((sourceHeight / Math.max(sourceWidth, 1)) * width))
+    const frameCount = Math.max(1, Math.min(300, Math.ceil(Math.max(0.05, item.end - item.start) * renderFps)))
+    return Math.max(largest, width * height * 4 * frameCount)
+  }, 0)
+
+  const AnimatedGifPreview = ({
+    gifUrl,
+    posterSrc,
+    alt,
+    className,
+  }: {
+    gifUrl?: string
+    posterSrc?: string
+    alt: string
+    className?: string
+  }) => {
+    const source = posterSrc || gifUrl
+
+    if (!source) {
+      return <div className={className} />
+    }
+
+    return <img className={className} src={source} alt={alt} loading="lazy" decoding="async" />
+  }
 
   const renderScreen = () => {
     if (screen === 'empty') {
@@ -809,13 +1334,12 @@ function Workspace() {
               <span className="mini-label">Selected range</span>
               <h3>{formatTime(selectionStart)} - {formatTime(selectionEnd)}</h3>
             </div>
-            <button
-              className="primary-btn"
-              type="button"
-              disabled={!videoUrl || selectionDuration <= 0}
-              onClick={addCurrentSelectionToQueue}
-            >
-              Add as one GIF
+            <div className="chip-group" role="group" aria-label="Export format">
+              <button type="button" className={`video-chip ${exportFormat === 'gif' ? 'active' : ''}`} aria-pressed={exportFormat === 'gif'} onClick={() => chooseExportFormat('gif')}>GIF</button>
+              <button type="button" className={`video-chip ${exportFormat === 'mp4' ? 'active' : ''}`} aria-pressed={exportFormat === 'mp4'} onClick={() => chooseExportFormat('mp4')}>MP4 · silent</button>
+            </div>
+            <button className="primary-btn" type="button" disabled={!videoUrl || selectionDuration <= 0} onClick={addCurrentSelectionToQueue}>
+              Add {exportFormat === 'gif' ? 'GIF' : 'MP4'}
             </button>
           </div>
 
@@ -840,7 +1364,7 @@ function Workspace() {
               value={clipLengthSeconds}
               onChange={(event) => setClipLengthSeconds(Number(event.target.value))}
             >
-              {[5, 9, 10, 12, 15].map((seconds) => (
+              {Array.from({ length: 15 }, (_, index) => index + 1).map((seconds) => (
                 <option key={seconds} value={seconds}>{seconds} seconds</option>
               ))}
             </select>
@@ -866,7 +1390,7 @@ function Workspace() {
               <div className="batch-preview" />
               <div className="queue-list" onScroll={(event) => setQueueScrollTop(event.currentTarget.scrollTop)}>
                 {queue.length === 0 ? (
-                  <p className="empty-queue-text">No GIFs queued yet.</p>
+                  <p className="empty-queue-text">No clips queued yet.</p>
                 ) : (
                   <>
                     {queueVirtualStart > 0 ? (
@@ -887,6 +1411,24 @@ function Workspace() {
             </div>
 
             <div className="batch-card form-card">
+              <div className="setting-row export-format-setting">
+                <strong>Export format</strong>
+                <div className="chip-group" role="group" aria-label="Export format">
+                  <button
+                    type="button"
+                    className={`video-chip ${exportFormat === 'gif' ? 'active' : ''}`}
+                    aria-pressed={exportFormat === 'gif'}
+                    onClick={() => chooseExportFormat('gif')}
+                  >GIF</button>
+                  <button
+                    type="button"
+                    className={`video-chip ${exportFormat === 'mp4' ? 'active' : ''}`}
+                    aria-pressed={exportFormat === 'mp4'}
+                    onClick={() => chooseExportFormat('mp4')}
+                  >MP4 · silent</button>
+                </div>
+              </div>
+              <p className="export-format-help">MP4 exports are silent. Looping after sharing depends on the recipient’s app; previews loop here. FPS, resolution, and quality settings below apply to GIF exports.</p>
               <div className="setting-row">
                 <label htmlFor="quality-select">GIF quality</label>
                 <select id="quality-select" value={qualityPreset} onChange={(event) => setQualityPreset(event.target.value as QualityPreset)}>
@@ -916,7 +1458,13 @@ function Workspace() {
                 <label>Loop</label>
                 <span>{loopMode ? 'Forward' : 'Once'}</span>
               </div>
-              <button className="primary-btn queue-button" type="button" disabled={!queue.length} onClick={startProcessingQueue}>
+              {requestedFrameCappedCount > 0 ? (
+                <p className="conversion-warning">{requestedFrameCappedCount} clip(s) exceed the 300-frame safety cap. Their effective FPS will be reduced to preserve clip duration.</p>
+              ) : null}
+              {largestRawFrameMemory > 256 * 1024 * 1024 ? (
+                <p className="conversion-warning">The largest clip may require about {formatFileSize(largestRawFrameMemory)} of raw frame memory. Lower resolution, FPS, or clip length to reduce browser memory use.</p>
+              ) : null}
+              <button className="primary-btn queue-button" type="button" disabled={!queue.length} onClick={() => void startProcessingQueue()}>
                 Convert Selected
               </button>
             </div>
@@ -926,41 +1474,88 @@ function Workspace() {
     }
 
     if (screen === 'processing') {
-      const progressValue = Math.round(processingProgress)
-
       return (
-        <div className="screen-panel processing-panel processing-overlay" role="status" aria-live="polite">
-          <div
-            className="progress-ring"
-            role="progressbar"
-            aria-label="GIF conversion progress"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={progressValue}
-            style={{ background: `conic-gradient(#22c55e 0 ${progressValue}%, rgba(148, 163, 184, 0.16) ${progressValue}% 100%)` }}
-          >
-            <div className="progress-inner">{progressValue}%</div>
+        <div className="screen-panel processing-panel" aria-live="polite">
+          <div className="processing-header">
+            <div className="processing-copy">
+              <h3>Converting clip exports</h3>
+              <p>{processingLabel ? `Now processing ${processingLabel}` : 'Preparing your video…'} · Clip {processingCount.current} of {processingCount.total}</p>
+            </div>
+            <button className="ghost-btn" type="button" onClick={cancelProcessing}>Cancel conversion</button>
           </div>
-          <div className="processing-copy">
-            <h3>Processing GIFs</h3>
-            <p>{processingLabel ? `Now converting ${processingLabel}` : 'Preparing your video…'}</p>
-            <p>GIF {processingCount.current} of {processingCount.total}</p>
+          <div className="processing-clip-list">
+            {queue.map((item, index) => {
+              const statusLabel = {
+                waiting: 'Staged',
+                processing: `Processing · ${Math.round(item.progress)}%`,
+                ready: 'Completed',
+                failed: 'Conversion failed',
+                cancelled: 'Cancelled',
+              }[item.status]
+
+              return (
+                <article className="processing-clip-card" key={item.id}>
+                  {item.gifUrl || item.previewSrc ? (
+                    <AnimatedGifPreview
+                      className="processing-clip-preview"
+                      gifUrl={item.gifUrl}
+                      posterSrc={item.previewSrc}
+                      alt={`${item.label} preview`}
+                    />
+                  ) : (
+                    <div className="processing-clip-preview preview-placeholder">Frame preview appears when processing starts</div>
+                  )}
+                  <div className="processing-clip-meta">
+                    <strong>{item.label}</strong>
+                    <span>Clip {index + 1} · {formatPreciseTime(item.end - item.start)}</span>
+                  </div>
+                  {getReadyExport(item) ? (
+                    <div className="processing-clip-actions">
+                      <a className="download-link" href={getReadyExport(item)!.url} download={`${item.label}.${getReadyExport(item)!.format}`}>
+                        Download {getReadyExport(item)!.format.toUpperCase()}
+                      </a>
+                      <span className="result-file-size">{formatFileSize(getReadyExport(item)!.sizeBytes || 0)}</span>
+                    </div>
+                  ) : null}
+                  {item.error ? <span className="render-error">{item.error}</span> : null}
+                  <div className="processing-clip-status">{statusLabel}</div>
+                  <div
+                    className="clip-progress-track"
+                    role="progressbar"
+                    aria-label={`${item.label} conversion progress`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(item.progress)}
+                  >
+                    <div className="clip-progress-fill" style={{ width: `${Math.max(0, Math.min(100, item.progress))}%` }} />
+                  </div>
+                </article>
+              )
+            })}
           </div>
-          <button className="ghost-btn" type="button" onClick={cancelProcessing}>Cancel conversion</button>
         </div>
       )
     }
 
     if (screen === 'results') {
-      const completedCount = queue.filter((item) => item.gifUrl).length
+      const completedCount = queue.filter((item) => getReadyExport(item)).length
       const failedCount = queue.filter((item) => item.error).length
+      const queueSummary = getQueueStatusCounts()
+      const allFinished = queue.length > 0 && queue.every((item) => ['ready', 'failed', 'cancelled'].includes(item.status))
+      const partialResultsAvailable = completedCount > 0 && !allFinished
+      const readySummary = completedCount > 0
+        ? `${completedCount} clip export${completedCount === 1 ? '' : 's'} ready to save`
+        : 'No clip exports ready to save'
 
       return (
         <div className="screen-panel results-panel">
           <div className="results-header">
             <div>
-              <span className="mini-label">GIF Collection</span>
-              <h3>{completedCount > 0 ? `${completedCount} GIF${completedCount === 1 ? '' : 's'} ready to save` : 'No GIFs ready to save'}{failedCount > 0 ? ` · ${failedCount} need attention` : ''}</h3>
+              <span className="mini-label">Clip Collection</span>
+              <h3>
+                {partialResultsAvailable ? `${readySummary} · ${queueSummary.processing + queueSummary.waiting} still processing` : readySummary}
+                {failedCount > 0 && !partialResultsAvailable ? ` · ${failedCount} need attention` : ''}
+              </h3>
             </div>
             <button
               className="ghost-btn"
@@ -975,8 +1570,8 @@ function Workspace() {
           </div>
 
           <div className="results-actions">
-            {queue.some((item) => item.gifUrl) ? (
-              <button className="primary-btn" type="button" onClick={downloadAllGifs}>Download All GIFs</button>
+            {allFinished && completedCount > 0 ? (
+              <button className="primary-btn" type="button" onClick={downloadAllGifs}>Download All Files</button>
             ) : null}
             {queue.some((item) => item.error) ? (
               <button className="ghost-btn" type="button" onClick={() => void startProcessingQueue(true)}>Retry Failed</button>
@@ -985,32 +1580,53 @@ function Workspace() {
 
           <div className="result-grid">
             {queue.length > 0 ? (
-              queue.map((item, index) => (
-                <div className="result-card" key={item.id}>
-                  {item.gifUrl ? (
-                    <img className="mini-thumb" src={item.gifUrl} alt={item.label} />
+              queue.map((item, index) => {
+                const output = getReadyExport(item)
+                return <div className="result-card" key={item.id}>
+                  {output?.format === 'mp4' ? (
+                    <video className="mini-thumb" src={output.url} muted loop autoPlay playsInline />
+                  ) : output?.format === 'gif' ? (
+                    <AnimatedGifPreview
+                      className="mini-thumb"
+                      gifUrl={output.url}
+                      posterSrc={item.previewSrc}
+                      alt={item.label}
+                    />
+                  ) : item.previewSrc ? (
+                    <img className="mini-thumb" src={item.previewSrc} alt={`${item.label} frame preview`} loading="lazy" decoding="async" />
                   ) : (
                     <div className="mini-thumb" />
                   )}
                   <strong>{item.label}</strong>
                   <span>{formatTime(item.end - item.start)}</span>
-                  {item.gifUrl && typeof item.gifSizeBytes === 'number' ? <span className="result-file-size">{formatFileSize(item.gifSizeBytes)}</span> : null}
+                  {output?.sizeBytes !== undefined ? <span className="result-file-size">{formatFileSize(output.sizeBytes)}</span> : null}
+                  <div className="clip-progress-track result-progress-track" aria-label={`${item.label} status: ${item.status}`}>
+                    <div className="clip-progress-fill" style={{ width: `${Math.max(0, Math.min(100, item.progress))}%` }} />
+                  </div>
                   <small>#{index + 1}</small>
-                  {item.gifUrl ? (
-                    <a className="download-link" href={item.gifUrl} download={`${item.label}.gif`}>
-                      Download GIF
-                    </a>
+                  {output ? (
+                    <>
+                      <a className="download-link" href={output.url} download={`${item.label}.${output.format}`}>
+                        Download {output.format.toUpperCase()}
+                      </a>
+                      {item.error ? (
+                        <>
+                          <span className="render-error">Previous export kept. Latest attempt: {item.error}</span>
+                          <button className="small-btn" type="button" onClick={() => void startProcessingQueue(true, item.id)}>Retry this clip</button>
+                        </>
+                      ) : null}
+                    </>
                   ) : item.error ? (
                     <>
                       <span className="render-error">Conversion failed: {item.error}</span>
-                      <button className="small-btn" type="button" onClick={() => void startProcessingQueue(true, item.id)}>Retry this GIF</button>
+                      <button className="small-btn" type="button" onClick={() => void startProcessingQueue(true, item.id)}>Retry this clip</button>
                     </>
                   ) : null}
                 </div>
-              ))
+              })
             ) : (
               <div className="result-card empty-result-card">
-                <strong>No GIFs generated yet</strong>
+                <strong>No clip exports yet</strong>
                 <span>Add a clip to the queue first.</span>
               </div>
             )}
@@ -1154,7 +1770,11 @@ function Workspace() {
               <span className="selection-stat"><strong>End</strong> {formatPreciseTime(selectionEnd)}</span>
               <span className="selection-stat highlight"><strong>Duration</strong> {formatTime(selectionDuration)}</span>
             </div>
-            <button className="primary-btn" type="button" disabled={!videoUrl || selectionDuration <= 0} onClick={addCurrentSelectionToQueue}>Add as one GIF</button>
+            <div className="chip-group" role="group" aria-label="Export format">
+              <button type="button" className={`video-chip ${exportFormat === 'gif' ? 'active' : ''}`} aria-pressed={exportFormat === 'gif'} onClick={() => chooseExportFormat('gif')}>GIF</button>
+              <button type="button" className={`video-chip ${exportFormat === 'mp4' ? 'active' : ''}`} aria-pressed={exportFormat === 'mp4'} onClick={() => chooseExportFormat('mp4')}>MP4 · silent</button>
+            </div>
+            <button className="primary-btn" type="button" disabled={!videoUrl || selectionDuration <= 0} onClick={addCurrentSelectionToQueue}>Add {exportFormat === 'gif' ? 'GIF' : 'MP4'}</button>
           </div>
 
           <div
@@ -1202,8 +1822,8 @@ function Workspace() {
           </div>
 
           <nav className="sidebar-nav" aria-label="Main navigation">
-            <button className="nav-button active" type="button" disabled={screen === 'processing'} onClick={startNewProject}>New</button>
-            <button className="nav-button" type="button" disabled={screen === 'processing'} onClick={() => uploadInputRef.current?.click()}>Open</button>
+            <button className="nav-button active" type="button" disabled={processingActiveRef.current} onClick={startNewProject}>New</button>
+            <button className="nav-button" type="button" disabled={processingActiveRef.current} onClick={() => uploadInputRef.current?.click()}>Open</button>
           </nav>
 
           <label className="upload-trigger" htmlFor="video-upload">
@@ -1220,10 +1840,10 @@ function Workspace() {
             </div>
 
             <div className="toolbar-actions">
-              <label className={`ghost-btn upload-label ${screen === 'processing' ? 'disabled-label' : ''}`} htmlFor="video-upload" aria-disabled={screen === 'processing'}>
+              <label className={`ghost-btn upload-label ${processingActiveRef.current ? 'disabled-label' : ''}`} htmlFor="video-upload" aria-disabled={processingActiveRef.current}>
                 Change video
               </label>
-              <button className="primary-btn" type="button" disabled={!queue.length || screen === 'processing'} onClick={startProcessingQueue}>
+              <button className="primary-btn" type="button" disabled={!queue.length || processingActiveRef.current} onClick={() => void startProcessingQueue()}>
                 Convert All
               </button>
             </div>
@@ -1235,7 +1855,7 @@ function Workspace() {
                 key={item.key}
                 type="button"
                 className={`tab-btn ${screen === item.key ? 'active' : ''}`}
-                disabled={screen === 'processing'}
+                disabled={processingActiveRef.current || (item.key === 'processing' && screen !== 'processing')}
                 onClick={() => setScreen(item.key)}
               >
                 {item.label}
